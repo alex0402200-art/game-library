@@ -1,26 +1,40 @@
 package com.example.gamelibrary;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.UriPermission;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.text.Editable;
+import android.text.InputType;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
 import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.GridView;
 import android.widget.LinearLayout;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.documentfile.provider.DocumentFile;
 
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
@@ -29,6 +43,10 @@ public class MainActivity extends Activity {
     private static final int REQ_PICK_FOLDER = 1;
     private static final String PREFS = "library";
     private static final String KEY_FOLDER = "folder_uri";
+
+    private static final String[] PRESETS = {"Stabil", "Intermediate", "Performance"};
+    private static final String[] RESOLUTIONS = {"800x600", "1280x720", "1920x1080"};
+    private static final String[] DRIVERS = {"DXVK", "VKD3D", "WineD3D"};
 
     static class Game {
         final String name;
@@ -40,13 +58,17 @@ public class MainActivity extends Activity {
         }
     }
 
-    private final List<Game> games = new ArrayList<>();
+    private final List<Game> all = new ArrayList<>();
+    private final List<Game> shown = new ArrayList<>();
     private GameAdapter adapter;
     private TextView status;
+    private EditText searchBox;
+    private JSONObject profiles = new JSONObject();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        loadProfiles();
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -64,6 +86,19 @@ public class MainActivity extends Activity {
         pick.setOnClickListener(v -> pickFolder());
         root.addView(pick);
 
+        searchBox = new EditText(this);
+        searchBox.setHint("Cari game...");
+        searchBox.setHintTextColor(Color.GRAY);
+        searchBox.setTextColor(Color.WHITE);
+        searchBox.setSingleLine(true);
+        searchBox.setInputType(InputType.TYPE_CLASS_TEXT);
+        searchBox.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(Editable s) { applyFilter(); }
+        });
+        root.addView(searchBox);
+
         status = new TextView(this);
         status.setTextColor(Color.LTGRAY);
         status.setText("Belum ada folder dipilih");
@@ -74,16 +109,15 @@ public class MainActivity extends Activity {
         grid.setNumColumns(3);
         adapter = new GameAdapter();
         grid.setAdapter(adapter);
-        grid.setOnItemClickListener((parent, view, pos, id) ->
-                Toast.makeText(this,
-                        "Play: " + games.get(pos).name + " (belum terhubung ke Winlator)",
-                        Toast.LENGTH_SHORT).show());
+        grid.setOnItemClickListener((parent, view, pos, id) -> showProfile(shown.get(pos)));
         root.addView(grid, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         setContentView(root);
         restoreFolder();
     }
+
+    // ---------- Folder ----------
 
     private void pickFolder() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
@@ -125,11 +159,11 @@ public class MainActivity extends Activity {
             List<Game> found = new ArrayList<>();
             DocumentFile root = DocumentFile.fromTreeUri(this, treeUri);
             if (root != null) walk(root, 0, found);
+            Collections.sort(found, (a, b) -> a.name.compareToIgnoreCase(b.name));
             runOnUiThread(() -> {
-                games.clear();
-                games.addAll(found);
-                adapter.notifyDataSetChanged();
-                status.setText(found.size() + " file .exe ditemukan");
+                all.clear();
+                all.addAll(found);
+                applyFilter();
             });
         }).start();
     }
@@ -154,18 +188,123 @@ public class MainActivity extends Activity {
                 || n.startsWith("dxsetup") || n.startsWith("crashhandler"));
     }
 
+    private void applyFilter() {
+        String q = searchBox.getText().toString().trim().toLowerCase(Locale.ROOT);
+        shown.clear();
+        for (Game g : all) {
+            if (q.isEmpty() || g.name.toLowerCase(Locale.ROOT).contains(q)) shown.add(g);
+        }
+        adapter.notifyDataSetChanged();
+        status.setText(shown.size() + " dari " + all.size() + " game");
+    }
+
+    // ---------- Profil ----------
+
+    private File profileFile() {
+        return new File(getFilesDir(), "profiles.json");
+    }
+
+    private void loadProfiles() {
+        try {
+            File f = profileFile();
+            if (!f.exists()) return;
+            byte[] buf = new byte[(int) f.length()];
+            try (FileInputStream in = new FileInputStream(f)) {
+                int off = 0;
+                while (off < buf.length) {
+                    int r = in.read(buf, off, buf.length - off);
+                    if (r < 0) break;
+                    off += r;
+                }
+            }
+            profiles = new JSONObject(new String(buf, StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            profiles = new JSONObject();
+        }
+    }
+
+    private void saveProfiles() {
+        try (FileOutputStream out = new FileOutputStream(profileFile())) {
+            out.write(profiles.toString(2).getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            Toast.makeText(this, "Gagal menyimpan profil", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void storeProfile(Game g, Spinner preset, Spinner res, Spinner drv) {
+        try {
+            JSONObject p = new JSONObject();
+            p.put("preset", (String) preset.getSelectedItem());
+            p.put("resolution", (String) res.getSelectedItem());
+            p.put("driver", (String) drv.getSelectedItem());
+            profiles.put(g.uri.toString(), p);
+            saveProfiles();
+            adapter.notifyDataSetChanged();
+        } catch (Exception e) {
+            Toast.makeText(this, "Gagal menyimpan profil", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private Spinner addSpinner(LinearLayout box, String label, String[] items, String selected) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setPadding(0, dp(10), 0, 0);
+        box.addView(t);
+        Spinner s = new Spinner(this);
+        s.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item, items));
+        for (int i = 0; i < items.length; i++) {
+            if (items[i].equals(selected)) s.setSelection(i);
+        }
+        box.addView(s);
+        return s;
+    }
+
+    private void showProfile(Game g) {
+        JSONObject p = profiles.optJSONObject(g.uri.toString());
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(12), dp(20), 0);
+
+        Spinner sPreset = addSpinner(box, "Preset CPU (Box64)", PRESETS,
+                p == null ? null : p.optString("preset"));
+        Spinner sRes = addSpinner(box, "Resolusi", RESOLUTIONS,
+                p == null ? null : p.optString("resolution"));
+        Spinner sDrv = addSpinner(box, "Driver grafis", DRIVERS,
+                p == null ? null : p.optString("driver"));
+
+        new AlertDialog.Builder(this)
+                .setTitle(g.name)
+                .setView(box)
+                .setPositiveButton("Simpan", (d, w) -> storeProfile(g, sPreset, sRes, sDrv))
+                .setNeutralButton("Play", (d, w) -> {
+                    storeProfile(g, sPreset, sRes, sDrv);
+                    Toast.makeText(this,
+                            "Play " + g.name + " | " + sPreset.getSelectedItem()
+                                    + ", " + sRes.getSelectedItem()
+                                    + ", " + sDrv.getSelectedItem()
+                                    + " (belum terhubung ke Winlator)",
+                            Toast.LENGTH_LONG).show();
+                })
+                .setNegativeButton("Batal", null)
+                .show();
+    }
+
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
+    // ---------- Grid ----------
+
     class GameAdapter extends BaseAdapter {
-        @Override public int getCount() { return games.size(); }
-        @Override public Object getItem(int i) { return games.get(i); }
+        @Override public int getCount() { return shown.size(); }
+        @Override public Object getItem(int i) { return shown.get(i); }
         @Override public long getItemId(int i) { return i; }
 
         @Override
         public View getView(int i, View convertView, ViewGroup parent) {
-            Game g = games.get(i);
+            Game g = shown.get(i);
 
             LinearLayout tile = new LinearLayout(MainActivity.this);
             tile.setOrientation(LinearLayout.VERTICAL);
@@ -195,7 +334,17 @@ public class MainActivity extends Activity {
             label.setPadding(0, dp(6), 0, 0);
             tile.addView(label);
 
+            JSONObject p = profiles.optJSONObject(g.uri.toString());
+            if (p != null) {
+                TextView sub = new TextView(MainActivity.this);
+                sub.setText(p.optString("preset") + " | " + p.optString("resolution"));
+                sub.setTextColor(Color.GRAY);
+                sub.setTextSize(10);
+                sub.setGravity(Gravity.CENTER);
+                tile.addView(sub);
+            }
+
             return tile;
         }
     }
-      }
+}
