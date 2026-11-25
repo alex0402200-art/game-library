@@ -6,7 +6,12 @@ import android.content.Intent;
 import android.content.UriPermission;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
@@ -19,11 +24,12 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.BaseAdapter;
-import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.GridView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -40,9 +46,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 
 public class MainActivity extends Activity {
 
@@ -50,6 +59,10 @@ public class MainActivity extends Activity {
     private static final int REQ_PICK_COVER = 2;
     private static final String PREFS = "library";
     private static final String KEY_FOLDER = "folder_uri";
+    private static final String KEY_FAV = "favorites";
+
+    private static final int BLUE = Color.parseColor("#0A9BFF");
+    private static final int PANEL = Color.parseColor("#CC041233");
 
     private static final String[] PRESETS = {"Stabil", "Intermediate", "Performance"};
     private static final String[] RESOLUTIONS = {"800x600", "1280x720", "1920x1080"};
@@ -68,79 +81,307 @@ public class MainActivity extends Activity {
     private final List<Game> all = new ArrayList<>();
     private final List<Game> shown = new ArrayList<>();
     private final Map<String, Bitmap> coverCache = new HashMap<>();
+    private final Set<String> favs = new HashSet<>();
     private GameAdapter adapter;
     private TextView status;
+    private TextView tabGame;
+    private TextView tabFav;
     private EditText searchBox;
     private JSONObject profiles = new JSONObject();
     private Game pendingCover;
+    private Uri currentFolder;
+    private int currentTab = 0;
+
+    // ---------- Latar belakang ----------
+
+    static class BackgroundView extends View {
+        private final Paint fill = new Paint();
+        private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final List<float[]> shapes = new ArrayList<>();
+
+        BackgroundView(android.content.Context c) {
+            super(c);
+            line.setStyle(Paint.Style.STROKE);
+            line.setStrokeWidth(5f);
+            line.setColor(Color.parseColor("#661B6FE0"));
+            Random r = new Random(7);
+            for (int i = 0; i < 34; i++) {
+                shapes.add(new float[]{r.nextFloat(), r.nextFloat(),
+                        r.nextInt(4), 24 + r.nextInt(30)});
+            }
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            int w = getWidth();
+            int h = getHeight();
+            fill.setShader(new android.graphics.LinearGradient(0, 0, 0, h,
+                    Color.parseColor("#020A2C"), Color.parseColor("#0A55E6"),
+                    android.graphics.Shader.TileMode.CLAMP));
+            canvas.drawRect(0, 0, w, h, fill);
+            for (float[] s : shapes) {
+                float x = s[0] * w;
+                float y = s[1] * h;
+                float r = s[3];
+                int type = (int) s[2];
+                if (type == 0) {
+                    canvas.drawCircle(x, y, r, line);
+                } else if (type == 1) {
+                    canvas.drawRect(x - r, y - r, x + r, y + r, line);
+                } else if (type == 2) {
+                    Path p = new Path();
+                    p.moveTo(x, y - r);
+                    p.lineTo(x + r, y + r);
+                    p.lineTo(x - r, y + r);
+                    p.close();
+                    canvas.drawPath(p, line);
+                } else {
+                    canvas.drawLine(x - r, y - r, x + r, y + r, line);
+                    canvas.drawLine(x + r, y - r, x - r, y + r, line);
+                }
+            }
+        }
+    }
+
+    // ---------- onCreate ----------
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         loadProfiles();
+        favs.addAll(getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getStringSet(KEY_FAV, new HashSet<String>()));
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#121212"));
-        root.setPadding(dp(16), dp(32), dp(16), dp(8));
+        FrameLayout frame = new FrameLayout(this);
+        frame.addView(new BackgroundView(this), new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        TextView title = new TextView(this);
-        title.setText("Game Library");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(24);
-        root.addView(title);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(dp(12), dp(8), dp(12), dp(8));
 
-        Button pick = new Button(this);
-        pick.setText("Pilih folder game");
-        pick.setOnClickListener(v -> pickFolder());
-        root.addView(pick);
+        // ----- Kolom kiri -----
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setBackgroundColor(Color.parseColor("#B3041233"));
+        tabGame = makeTab("Game", 0);
+        tabFav = makeTab("Favorit", 1);
+        tabs.addView(tabGame);
+        tabs.addView(tabFav);
+        left.addView(tabs, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         searchBox = new EditText(this);
         searchBox.setHint("Cari game...");
-        searchBox.setHintTextColor(Color.GRAY);
+        searchBox.setHintTextColor(Color.parseColor("#9FB4D8"));
         searchBox.setTextColor(Color.WHITE);
         searchBox.setSingleLine(true);
         searchBox.setInputType(InputType.TYPE_CLASS_TEXT);
+        searchBox.getBackground().setTint(BLUE);
         searchBox.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void afterTextChanged(Editable s) { applyFilter(); }
         });
-        root.addView(searchBox);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sp.topMargin = dp(6);
+        left.addView(searchBox, sp);
 
         status = new TextView(this);
-        status.setTextColor(Color.LTGRAY);
+        status.setTextColor(Color.parseColor("#9FB4D8"));
+        status.setTextSize(11);
         status.setText("Belum ada folder dipilih");
-        status.setPadding(0, dp(8), 0, dp(8));
-        root.addView(status);
+        status.setPadding(0, dp(4), 0, dp(4));
+        left.addView(status);
 
         GridView grid = new GridView(this);
-        grid.setNumColumns(3);
+        grid.setNumColumns(GridView.AUTO_FIT);
+        grid.setColumnWidth(dp(120));
+        grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
         adapter = new GameAdapter();
         grid.setAdapter(adapter);
         grid.setOnItemClickListener((parent, view, pos, id) -> showProfile(shown.get(pos)));
         grid.setOnItemLongClickListener((parent, view, pos, id) -> {
-            final Game g = shown.get(pos);
-            new AlertDialog.Builder(this)
-                    .setTitle(g.name)
-                    .setItems(new String[]{"Pilih gambar cover", "Hapus cover"},
-                            (d, which) -> {
-                                if (which == 0) {
-                                    pickCover(g);
-                                } else {
-                                    coverFile(g).delete();
-                                    coverCache.remove(coverKey(g));
-                                    adapter.notifyDataSetChanged();
-                                }
-                            })
-                    .show();
+            showGameMenu(shown.get(pos));
             return true;
         });
-        root.addView(grid, new LinearLayout.LayoutParams(
+        left.addView(grid, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        setContentView(root);
+        row.addView(left, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        // ----- Kolom kanan -----
+        LinearLayout right = new LinearLayout(this);
+        right.setOrientation(LinearLayout.VERTICAL);
+        right.setPadding(dp(12), 0, 0, 0);
+
+        right.addView(buildLogo(), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(70)));
+
+        LinearLayout menu = new LinearLayout(this);
+        menu.setOrientation(LinearLayout.VERTICAL);
+        menu.setBackgroundColor(PANEL);
+        LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        mp.topMargin = dp(10);
+        right.addView(menu, mp);
+
+        menu.addView(menuItem("▶", "Pilih Folder Game", true, v -> pickFolder()));
+        menu.addView(menuItem("⚙", "Pengaturan", false, v -> showSettings()));
+        menu.addView(menuItem("ⓘ", "Tentang", false, v -> showAbout()));
+        menu.addView(menuItem("✕", "Keluar", false, v -> finish()));
+
+        row.addView(right, new LinearLayout.LayoutParams(dp(230),
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
+        frame.addView(row, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        setContentView(frame);
+
+        selectTab(0);
         restoreFolder();
+    }
+
+    // ---------- Komponen UI ----------
+
+    private TextView makeTab(String text, final int index) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(18);
+        t.setTextColor(Color.WHITE);
+        t.setPadding(dp(18), dp(8), dp(18), dp(8));
+        t.setOnClickListener(v -> selectTab(index));
+        return t;
+    }
+
+    private void selectTab(int index) {
+        currentTab = index;
+        tabGame.setBackgroundColor(index == 0 ? BLUE : Color.TRANSPARENT);
+        tabFav.setBackgroundColor(index == 1 ? BLUE : Color.TRANSPARENT);
+        if (adapter != null && status != null) applyFilter();
+    }
+
+    private View buildLogo() {
+        Bitmap logo = null;
+        try (InputStream in = getAssets().open("logo.png")) {
+            logo = BitmapFactory.decodeStream(in);
+        } catch (Exception ignored) {
+        }
+        if (logo != null) {
+            ImageView iv = new ImageView(this);
+            iv.setImageBitmap(logo);
+            iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(10));
+            bg.setColor(Color.parseColor("#0B1F7A"));
+            iv.setBackground(bg);
+            iv.setClipToOutline(true);
+            return iv;
+        }
+        TextView t = new TextView(this);
+        t.setText("EXE EMULATOR");
+        t.setTextColor(Color.WHITE);
+        t.setTextSize(22);
+        t.setTypeface(Typeface.defaultFromStyle(Typeface.BOLD_ITALIC));
+        t.setGravity(Gravity.CENTER);
+        return t;
+    }
+
+    private View menuItem(String icon, String label, boolean highlight, View.OnClickListener l) {
+        LinearLayout item = new LinearLayout(this);
+        item.setOrientation(LinearLayout.HORIZONTAL);
+        item.setGravity(Gravity.CENTER_VERTICAL);
+        item.setPadding(dp(14), dp(12), dp(14), dp(12));
+        item.setBackgroundColor(highlight ? BLUE : Color.TRANSPARENT);
+        item.setOnClickListener(l);
+
+        TextView ic = new TextView(this);
+        ic.setText(icon);
+        ic.setTextColor(Color.WHITE);
+        ic.setTextSize(20);
+        ic.setGravity(Gravity.CENTER);
+        item.addView(ic, new LinearLayout.LayoutParams(dp(34),
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView tx = new TextView(this);
+        tx.setText(label);
+        tx.setTextColor(Color.WHITE);
+        tx.setTextSize(16);
+        tx.setPadding(dp(10), 0, 0, 0);
+        item.addView(tx);
+        return item;
+    }
+
+    // ---------- Dialog gelap ----------
+
+    private void showDark(AlertDialog.Builder b) {
+        AlertDialog d = b.create();
+        d.show();
+        if (d.getWindow() != null) {
+            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+        }
+    }
+
+    private AlertDialog.Builder darkBuilder() {
+        return new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK);
+    }
+
+    private void showGameMenu(final Game g) {
+        final boolean isFav = favs.contains(g.uri.toString());
+        showDark(darkBuilder()
+                .setTitle(g.name)
+                .setItems(new String[]{"Pilih gambar cover", "Hapus cover",
+                                isFav ? "Hapus dari favorit" : "Tambah ke favorit"},
+                        (d, which) -> {
+                            if (which == 0) {
+                                pickCover(g);
+                            } else if (which == 1) {
+                                coverFile(g).delete();
+                                coverCache.remove(coverKey(g));
+                                adapter.notifyDataSetChanged();
+                            } else {
+                                if (isFav) favs.remove(g.uri.toString());
+                                else favs.add(g.uri.toString());
+                                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                                        .putStringSet(KEY_FAV, new HashSet<>(favs)).apply();
+                                applyFilter();
+                            }
+                        }));
+    }
+
+    private void showSettings() {
+        showDark(darkBuilder()
+                .setTitle("Pengaturan")
+                .setItems(new String[]{"Pindai ulang folder", "Hapus semua cover"},
+                        (d, which) -> {
+                            if (which == 0) {
+                                if (currentFolder != null) scan(currentFolder);
+                                else Toast.makeText(this, "Pilih folder dulu",
+                                        Toast.LENGTH_SHORT).show();
+                            } else {
+                                File[] files = getFilesDir().listFiles();
+                                if (files != null) {
+                                    for (File f : files) {
+                                        if (f.getName().startsWith("cover_")) f.delete();
+                                    }
+                                }
+                                coverCache.clear();
+                                adapter.notifyDataSetChanged();
+                            }
+                        })
+                .setNegativeButton("Tutup", null));
+    }
+
+    private void showAbout() {
+        showDark(darkBuilder()
+                .setTitle("EXE Emulator")
+                .setMessage("Pustaka game PC.\nVersi 0.2\n\nTombol Play belum terhubung ke Winlator.")
+                .setPositiveButton("OK", null));
     }
 
     // ---------- Folder ----------
@@ -200,7 +441,8 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void scan(Uri treeUri) {
+    private void scan(final Uri treeUri) {
+        currentFolder = treeUri;
         status.setText("Memindai folder...");
         new Thread(() -> {
             List<Game> found = new ArrayList<>();
@@ -239,11 +481,12 @@ public class MainActivity extends Activity {
         String q = searchBox.getText().toString().trim().toLowerCase(Locale.ROOT);
         shown.clear();
         for (Game g : all) {
+            if (currentTab == 1 && !favs.contains(g.uri.toString())) continue;
             if (q.isEmpty() || g.name.toLowerCase(Locale.ROOT).contains(q)) shown.add(g);
         }
         adapter.notifyDataSetChanged();
         status.setText(shown.size() + " dari " + all.size()
-                + " game  |  tahan lama untuk ganti cover");
+                + " game  |  tahan lama untuk cover / favorit");
     }
 
     // ---------- Cover ----------
@@ -343,6 +586,7 @@ public class MainActivity extends Activity {
     private Spinner addSpinner(LinearLayout box, String label, String[] items, String selected) {
         TextView t = new TextView(this);
         t.setText(label);
+        t.setTextColor(Color.WHITE);
         t.setPadding(0, dp(10), 0, 0);
         box.addView(t);
         Spinner s = new Spinner(this);
@@ -355,23 +599,26 @@ public class MainActivity extends Activity {
         return s;
     }
 
-    private void showProfile(Game g) {
+    private void showProfile(final Game g) {
         JSONObject p = profiles.optJSONObject(g.uri.toString());
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(12), dp(20), 0);
 
-        Spinner sPreset = addSpinner(box, "Preset CPU (Box64)", PRESETS,
+        final Spinner sPreset = addSpinner(box, "Preset CPU (Box64)", PRESETS,
                 p == null ? null : p.optString("preset"));
-        Spinner sRes = addSpinner(box, "Resolusi", RESOLUTIONS,
+        final Spinner sRes = addSpinner(box, "Resolusi", RESOLUTIONS,
                 p == null ? null : p.optString("resolution"));
-        Spinner sDrv = addSpinner(box, "Driver grafis", DRIVERS,
+        final Spinner sDrv = addSpinner(box, "Driver grafis", DRIVERS,
                 p == null ? null : p.optString("driver"));
 
-        new AlertDialog.Builder(this)
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        showDark(darkBuilder()
                 .setTitle(g.name)
-                .setView(box)
+                .setView(sv)
                 .setPositiveButton("Simpan", (d, w) -> storeProfile(g, sPreset, sRes, sDrv))
                 .setNeutralButton("Play", (d, w) -> {
                     storeProfile(g, sPreset, sRes, sDrv);
@@ -382,8 +629,7 @@ public class MainActivity extends Activity {
                                     + " (belum terhubung ke Winlator)",
                             Toast.LENGTH_LONG).show();
                 })
-                .setNegativeButton("Batal", null)
-                .show();
+                .setNegativeButton("Batal", null));
     }
 
     private int dp(int v) {
@@ -404,15 +650,15 @@ public class MainActivity extends Activity {
             LinearLayout tile = new LinearLayout(MainActivity.this);
             tile.setOrientation(LinearLayout.VERTICAL);
             tile.setGravity(Gravity.CENTER_HORIZONTAL);
-            tile.setPadding(dp(6), dp(10), dp(6), dp(10));
+            tile.setPadding(dp(6), dp(8), dp(6), dp(8));
 
             int hue = ((g.name.hashCode() % 360) + 360) % 360;
             GradientDrawable bg = new GradientDrawable();
-            bg.setCornerRadius(dp(14));
+            bg.setCornerRadius(dp(10));
             bg.setColor(Color.HSVToColor(new float[]{hue, 0.5f, 0.6f}));
 
             LinearLayout.LayoutParams boxSize =
-                    new LinearLayout.LayoutParams(dp(84), dp(112));
+                    new LinearLayout.LayoutParams(dp(100), dp(100));
 
             Bitmap cover = getCover(g);
             if (cover != null) {
@@ -426,16 +672,18 @@ public class MainActivity extends Activity {
                 TextView icon = new TextView(MainActivity.this);
                 icon.setText(g.name.isEmpty() ? "?" : g.name.substring(0, 1).toUpperCase(Locale.ROOT));
                 icon.setTextColor(Color.WHITE);
-                icon.setTextSize(28);
+                icon.setTextSize(30);
+                icon.setTypeface(Typeface.DEFAULT_BOLD);
                 icon.setGravity(Gravity.CENTER);
                 icon.setBackground(bg);
                 tile.addView(icon, boxSize);
             }
 
             TextView label = new TextView(MainActivity.this);
-            label.setText(g.name);
+            label.setText((favs.contains(g.uri.toString()) ? "★ " : "") + g.name);
             label.setTextColor(Color.WHITE);
-            label.setTextSize(12);
+            label.setTextSize(13);
+            label.setTypeface(Typeface.DEFAULT_BOLD);
             label.setGravity(Gravity.CENTER);
             label.setMaxLines(2);
             label.setEllipsize(TextUtils.TruncateAt.END);
@@ -446,7 +694,7 @@ public class MainActivity extends Activity {
             if (p != null) {
                 TextView sub = new TextView(MainActivity.this);
                 sub.setText(p.optString("preset") + " | " + p.optString("resolution"));
-                sub.setTextColor(Color.GRAY);
+                sub.setTextColor(Color.parseColor("#9FB4D8"));
                 sub.setTextSize(10);
                 sub.setGravity(Gravity.CENTER);
                 tile.addView(sub);
@@ -455,4 +703,4 @@ public class MainActivity extends Activity {
             return tile;
         }
     }
-            }
+}
