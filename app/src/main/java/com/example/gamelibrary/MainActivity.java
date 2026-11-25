@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.UriPermission;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -20,6 +22,7 @@ import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.GridView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -32,15 +35,19 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public class MainActivity extends Activity {
 
     private static final int REQ_PICK_FOLDER = 1;
+    private static final int REQ_PICK_COVER = 2;
     private static final String PREFS = "library";
     private static final String KEY_FOLDER = "folder_uri";
 
@@ -60,10 +67,12 @@ public class MainActivity extends Activity {
 
     private final List<Game> all = new ArrayList<>();
     private final List<Game> shown = new ArrayList<>();
+    private final Map<String, Bitmap> coverCache = new HashMap<>();
     private GameAdapter adapter;
     private TextView status;
     private EditText searchBox;
     private JSONObject profiles = new JSONObject();
+    private Game pendingCover;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -110,6 +119,23 @@ public class MainActivity extends Activity {
         adapter = new GameAdapter();
         grid.setAdapter(adapter);
         grid.setOnItemClickListener((parent, view, pos, id) -> showProfile(shown.get(pos)));
+        grid.setOnItemLongClickListener((parent, view, pos, id) -> {
+            final Game g = shown.get(pos);
+            new AlertDialog.Builder(this)
+                    .setTitle(g.name)
+                    .setItems(new String[]{"Pilih gambar cover", "Hapus cover"},
+                            (d, which) -> {
+                                if (which == 0) {
+                                    pickCover(g);
+                                } else {
+                                    coverFile(g).delete();
+                                    coverCache.remove(coverKey(g));
+                                    adapter.notifyDataSetChanged();
+                                }
+                            })
+                    .show();
+            return true;
+        });
         root.addView(grid, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -126,17 +152,38 @@ public class MainActivity extends Activity {
         startActivityForResult(i, REQ_PICK_FOLDER);
     }
 
+    private void pickCover(Game g) {
+        pendingCover = g;
+        Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+        i.setType("image/*");
+        startActivityForResult(Intent.createChooser(i, "Pilih gambar cover"), REQ_PICK_COVER);
+    }
+
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
-        if (req == REQ_PICK_FOLDER && res == RESULT_OK
-                && data != null && data.getData() != null) {
+        if (res != RESULT_OK || data == null || data.getData() == null) return;
+
+        if (req == REQ_PICK_FOLDER) {
             Uri uri = data.getData();
             getContentResolver().takePersistableUriPermission(
                     uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             getSharedPreferences(PREFS, MODE_PRIVATE)
                     .edit().putString(KEY_FOLDER, uri.toString()).apply();
             scan(uri);
+        } else if (req == REQ_PICK_COVER && pendingCover != null) {
+            final Game g = pendingCover;
+            final Uri img = data.getData();
+            new Thread(() -> {
+                boolean ok = saveCover(g, img);
+                runOnUiThread(() -> {
+                    coverCache.remove(coverKey(g));
+                    adapter.notifyDataSetChanged();
+                    if (!ok) {
+                        Toast.makeText(this, "Gagal memuat gambar", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }).start();
         }
     }
 
@@ -195,7 +242,55 @@ public class MainActivity extends Activity {
             if (q.isEmpty() || g.name.toLowerCase(Locale.ROOT).contains(q)) shown.add(g);
         }
         adapter.notifyDataSetChanged();
-        status.setText(shown.size() + " dari " + all.size() + " game");
+        status.setText(shown.size() + " dari " + all.size()
+                + " game  |  tahan lama untuk ganti cover");
+    }
+
+    // ---------- Cover ----------
+
+    private String coverKey(Game g) {
+        return Integer.toHexString(g.uri.toString().hashCode());
+    }
+
+    private File coverFile(Game g) {
+        return new File(getFilesDir(), "cover_" + coverKey(g) + ".jpg");
+    }
+
+    private boolean saveCover(Game g, Uri img) {
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            try (InputStream in = getContentResolver().openInputStream(img)) {
+                BitmapFactory.decodeStream(in, null, bounds);
+            }
+            int sample = 1;
+            while (bounds.outWidth / sample > 320 || bounds.outHeight / sample > 320) {
+                sample *= 2;
+            }
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = sample;
+            Bitmap bmp;
+            try (InputStream in = getContentResolver().openInputStream(img)) {
+                bmp = BitmapFactory.decodeStream(in, null, opts);
+            }
+            if (bmp == null) return false;
+            try (FileOutputStream out = new FileOutputStream(coverFile(g))) {
+                bmp.compress(Bitmap.CompressFormat.JPEG, 85, out);
+            }
+            bmp.recycle();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private Bitmap getCover(Game g) {
+        String k = coverKey(g);
+        if (coverCache.containsKey(k)) return coverCache.get(k);
+        File f = coverFile(g);
+        Bitmap b = f.exists() ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
+        coverCache.put(k, b);
+        return b;
     }
 
     // ---------- Profil ----------
@@ -316,13 +411,26 @@ public class MainActivity extends Activity {
             bg.setCornerRadius(dp(14));
             bg.setColor(Color.HSVToColor(new float[]{hue, 0.5f, 0.6f}));
 
-            TextView icon = new TextView(MainActivity.this);
-            icon.setText(g.name.isEmpty() ? "?" : g.name.substring(0, 1).toUpperCase(Locale.ROOT));
-            icon.setTextColor(Color.WHITE);
-            icon.setTextSize(28);
-            icon.setGravity(Gravity.CENTER);
-            icon.setBackground(bg);
-            tile.addView(icon, new LinearLayout.LayoutParams(dp(72), dp(72)));
+            LinearLayout.LayoutParams boxSize =
+                    new LinearLayout.LayoutParams(dp(84), dp(112));
+
+            Bitmap cover = getCover(g);
+            if (cover != null) {
+                ImageView iv = new ImageView(MainActivity.this);
+                iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                iv.setImageBitmap(cover);
+                iv.setBackground(bg);
+                iv.setClipToOutline(true);
+                tile.addView(iv, boxSize);
+            } else {
+                TextView icon = new TextView(MainActivity.this);
+                icon.setText(g.name.isEmpty() ? "?" : g.name.substring(0, 1).toUpperCase(Locale.ROOT));
+                icon.setTextColor(Color.WHITE);
+                icon.setTextSize(28);
+                icon.setGravity(Gravity.CENTER);
+                icon.setBackground(bg);
+                tile.addView(icon, boxSize);
+            }
 
             TextView label = new TextView(MainActivity.this);
             label.setText(g.name);
@@ -347,4 +455,4 @@ public class MainActivity extends Activity {
             return tile;
         }
     }
-}
+            }
